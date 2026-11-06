@@ -65,6 +65,12 @@ namespace SoLoud
 #ifdef __ANDROID__
 #include <android/api-level.h>
 #endif
+#if defined(__ANDROID__) && defined(MA_HAS_AAUDIO)
+// See the "AAudio low-latency buffer tuner" block below.
+#define SOLOUD_AAUDIO_LATENCY_TUNER 1
+#include <dlfcn.h>
+#include <atomic>
+#endif
 #include <math.h>
 #include <chrono>
 #include <thread>
@@ -132,6 +138,163 @@ namespace SoLoud
     };
     static DeferredDeviceConfig gDeferredConfig;
 
+#if defined(SOLOUD_AAUDIO_LATENCY_TUNER)
+    // ---------------------------------------------------------------------
+    // AAudio low-latency buffer tuner (fork patch, Android only)
+    //
+    // Why: with ma_performance_profile_low_latency AAudio opens an MMAP
+    // stream, but it keeps the stream's *buffer size* (how many frames the
+    // app may queue ahead of the hardware) at a large default. On a Huawei
+    // MRDI-W09 (Android 12) `dumpsys media.aaudio` showed 2160 frames
+    // (45 ms at 48 kHz) queued in the app stream with a burst of 240, no
+    // matter what `bufferSize` was passed to init(). miniaudio does not expose
+    // AAudioStream_setBufferSizeInFrames(), so we resolve it ourselves.
+    //
+    // What: after a stream starts, shrink its buffer to 2 bursts (the
+    // technique of Oboe's LatencyTuner). If the stream then underruns, grow
+    // it back by one burst per detected underrun-check, never above the size
+    // it was opened with, and never shrink it again for that stream.
+    //
+    // Scope: only when the backend is AAudio AND gMiniaudioLowLatency is
+    // true. Conservative profile, OpenSL ES and other platforms are untouched.
+    // Missing symbols (AAudio needs API 26 for some of them) => silently
+    // does nothing. `lowLatency: false` in init() is the opt-out.
+    //
+    // Threading: all stream calls are made from the audio data callback, on
+    // the stream's own callback thread, using pDevice->aaudio.pStreamPlayback.
+    // miniaudio closes/reopens that stream (reroute job thread, holding
+    // rerouteLock) only after the old stream has been closed, which joins its
+    // callback thread; the pointer is rewritten while no callback runs. So a
+    // callback never sees a stream being closed. Other threads (including the
+    // rerouted notification, which runs on that job thread) never touch the
+    // stream: they only raise an atomic "re-arm" flag, and the callback
+    // re-applies the target on the first buffer of the new stream.
+    // ---------------------------------------------------------------------
+    typedef int32_t (*AAudioGetIntFn)(void *stream);
+    typedef int32_t (*AAudioSetIntFn)(void *stream, int32_t value);
+    static AAudioGetIntFn gAAudioGetFramesPerBurst = nullptr;
+    static AAudioGetIntFn gAAudioGetBufferSize = nullptr;
+    static AAudioGetIntFn gAAudioGetXRunCount = nullptr;
+    static AAudioSetIntFn gAAudioSetBufferSize = nullptr;
+    static std::once_flag gAAudioResolveOnce;
+    static bool gAAudioSymbolsOk = false;
+    static std::atomic<bool> gAAudioTunerActive(false);
+    static std::atomic<bool> gAAudioTunerRearm(false);
+
+    // Touched only from the data callback thread.
+    struct AAudioTunerState
+    {
+        void *stream;
+        int32_t burst;
+        int32_t ceiling;
+        int32_t current;
+        int32_t lastXRuns;
+        ma_uint32 framesSinceCheck;
+        bool ok;
+    };
+    static AAudioTunerState gAAudioTuner = {};
+
+    static void aaudio_tuner_resolve()
+    {
+        void *lib = dlopen("libaaudio.so", RTLD_NOW);
+        if (lib == nullptr)
+            return;
+        gAAudioGetFramesPerBurst = (AAudioGetIntFn)dlsym(lib, "AAudioStream_getFramesPerBurst");
+        gAAudioGetBufferSize = (AAudioGetIntFn)dlsym(lib, "AAudioStream_getBufferSizeInFrames");
+        gAAudioGetXRunCount = (AAudioGetIntFn)dlsym(lib, "AAudioStream_getXRunCount");
+        gAAudioSetBufferSize = (AAudioSetIntFn)dlsym(lib, "AAudioStream_setBufferSizeInFrames");
+        gAAudioSymbolsOk = gAAudioGetFramesPerBurst && gAAudioGetBufferSize &&
+                           gAAudioGetXRunCount && gAAudioSetBufferSize;
+    }
+
+    // Safe from any thread: touches no stream, only arms the callback to
+    // (re)apply the target on the current stream. Call after every path that
+    // creates or restarts the stream.
+    static void aaudio_tuner_request(ma_device *pDevice)
+    {
+        if (!gMiniaudioLowLatency || pDevice == nullptr || pDevice->pContext == nullptr ||
+            pDevice->pContext->backend != ma_backend_aaudio)
+        {
+            gAAudioTunerActive.store(false);
+            return;
+        }
+        std::call_once(gAAudioResolveOnce, aaudio_tuner_resolve);
+        if (!gAAudioSymbolsOk)
+        {
+            gAAudioTunerActive.store(false);
+            return;
+        }
+        gAAudioTunerRearm.store(true);
+        gAAudioTunerActive.store(true);
+    }
+
+    // Called from the data callback. No locks, no allocation, no logging.
+    static void aaudio_tuner_tick(ma_device *pDevice, ma_uint32 frameCount)
+    {
+        if (!gAAudioTunerActive.load(std::memory_order_relaxed))
+            return;
+        if (pDevice->pContext->backend != ma_backend_aaudio)
+            return;
+        void *stream = pDevice->aaudio.pStreamPlayback;
+        if (stream == nullptr)
+            return;
+
+        AAudioTunerState &t = gAAudioTuner;
+        if (gAAudioTunerRearm.exchange(false) || stream != t.stream)
+        {
+            // New stream: take its opened size as the ceiling, shrink to 2 bursts.
+            t = AAudioTunerState();
+            t.stream = stream;
+            t.ceiling = gAAudioGetBufferSize(stream);
+            t.burst = gAAudioGetFramesPerBurst(stream);
+            if (t.ceiling <= 0 || t.burst <= 0)
+                return;
+            t.current = t.ceiling;
+            const int32_t target = 2 * t.burst;
+            if (target < t.ceiling)
+            {
+                const int32_t r = gAAudioSetBufferSize(stream, target);
+                if (r > 0)
+                    t.current = r;
+            }
+            // Baseline: underruns during startup do not count.
+            t.lastXRuns = gAAudioGetXRunCount(stream);
+            t.ok = t.lastXRuns >= 0;
+            return;
+        }
+        if (!t.ok)
+            return;
+
+        // Check underruns about once per second of audio.
+        t.framesSinceCheck += frameCount;
+        const ma_uint32 interval = pDevice->sampleRate > 0 ? pDevice->sampleRate : 48000;
+        if (t.framesSinceCheck < interval)
+            return;
+        t.framesSinceCheck = 0;
+
+        const int32_t xruns = gAAudioGetXRunCount(stream);
+        if (xruns < 0)
+        {
+            t.ok = false;
+            return;
+        }
+        if (xruns > t.lastXRuns)
+        {
+            t.lastXRuns = xruns;
+            if (t.current < t.ceiling)
+            {
+                int32_t next = t.current + t.burst;
+                if (next > t.ceiling)
+                    next = t.ceiling;
+                const int32_t r = gAAudioSetBufferSize(stream, next);
+                if (r > 0)
+                    t.current = r;
+            }
+        }
+    }
+#endif
+
+
     // Added by Marco Bavagnoli
     void on_notification(const ma_device_notification *pNotification)
     {
@@ -163,6 +326,11 @@ namespace SoLoud
 
         case ma_device_notification_type_rerouted:
         {
+#if defined(SOLOUD_AAUDIO_LATENCY_TUNER)
+            // Runs on miniaudio's reroute job thread with rerouteLock held; only
+            // arms a flag, the callback re-applies the target on the new stream.
+            aaudio_tuner_request(pNotification->pDevice);
+#endif
             if (soloud->_stateChangedCallback != nullptr)
                 soloud->_stateChangedCallback(2);
         }
@@ -248,6 +416,9 @@ namespace SoLoud
         soloud->mix((float *)pOutput, frameCount);
 
         MixerOutput::instance().onAudioData((float *)pOutput, frameCount);
+#if defined(SOLOUD_AAUDIO_LATENCY_TUNER)
+        aaudio_tuner_tick(pDevice, frameCount);
+#endif
     }
 
     static void soloud_miniaudio_deinit(SoLoud::Soloud *aSoloud)
@@ -416,6 +587,10 @@ namespace SoLoud
             }
 #endif
             result = ma_device_start(&gDevice);
+#if defined(SOLOUD_AAUDIO_LATENCY_TUNER)
+            if (result == MA_SUCCESS)
+                aaudio_tuner_request(&gDevice);
+#endif
         }
 #if defined(MA_HAS_AAUDIO)
         if (isAAudio)
@@ -547,6 +722,9 @@ namespace SoLoud
         }
         gDeviceInitDeferred = false;
         gDeviceStartDeferred = false;
+#if defined(SOLOUD_AAUDIO_LATENCY_TUNER)
+        aaudio_tuner_request(&gDevice);
+#endif
 
 #else
         // Linux and other platforms
@@ -731,6 +909,9 @@ namespace SoLoud
             gDeviceStopped = true;
             return UNKNOWN_ERROR;
         }
+#if defined(SOLOUD_AAUDIO_LATENCY_TUNER)
+        aaudio_tuner_request(&gDevice);
+#endif
 
         return 0;
     }
