@@ -35,7 +35,6 @@ Apps where sound must react quickly to input: instruments, drawing/stylus or tou
 
 - Less safety margin: the stream has about 15 ms of buffer instead of 45 ms, so a slow audio callback or a busy CPU can underrun sooner (the glitch is a click or dropout).
 - The patch reacts to underruns by growing the buffer, so it can drift back toward the old latency on devices that underrun a lot. It never shrinks again until the stream is recreated.
-- Slightly more wakeups and CPU for the same audio (smaller queue means the hardware is fed in smaller steps), so a small battery cost is possible. I have not measured it.
 - Tested on one device only.
 - Opt-out: pass `lowLatency: false` to `init()`; the patch is then inactive (this also selects the conservative AAudio profile, with its own tradeoffs; see the original docs).
 
