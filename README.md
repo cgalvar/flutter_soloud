@@ -19,7 +19,7 @@ I use flutter_soloud for a sound whose volume follows stylus motion (a pencil dr
 | | Queued in the app stream |
 |-|-|
 | Stock 4.1.7 | 2160 frames = 45 ms |
-| With this patch (initial stream, short session) | 720 frames = 15 ms, 0 xruns |
+| With this patch (initial stream, release build, about 2 minutes of use) | 720 frames = 15 ms, 0 xruns |
 
 How it was measured: `adb shell dumpsys media.aaudio`, reading `Write#` minus `Read#` for the app's output stream, at 48 kHz, burst 240, capacity 3840. One device (Huawei MRDI-W09, HarmonyOS 4.3 / Android 12, API 31), one short session. This is **only the app-side queue**, not end-to-end latency to the speaker (it does not include the mixer period, the HAL/DSP, or the DAC and speaker path). Other devices may behave differently.
 
