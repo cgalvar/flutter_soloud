@@ -1,3 +1,7 @@
+##### 4.1.7+fork.1 (unofficial fork of 4.1.7, branch `aaudio-low-latency-buffer`)
+- Android/AAudio, low-latency profile only: after each stream starts, shrink the stream buffer to 2 bursts with `AAudioStream_setBufferSizeInFrames`, and grow it by one burst (up to the opened size) when underruns are detected. Re-applied after reroute, resume and `changeDevice`. Measured on one device (Huawei MRDI-W09, Android 12): app-side queue 45 ms -> 15 ms. Reroute/xrun adaptation: device validation pending. See "About this fork" in the README.
+- `soloud_miniaudio.cpp`: `miniaudio_changeDevice_impl` stops the device when its state is not `stopped`, as in the package published on pub.dev (the `v4.1.7` git tag had `== started`).
+
 ##### 4.1.7 (X Xxx 2026)
 - fix: a device change that still fails now reports `SoLoudAudioDeviceFailedToStartCppException` instead of hanging. Thanks to @Colton127 #533
 - fix: `changeDevice()` now selects the system default device when called without an argument and reports device-change failures instead of silently succeeding. Thanks to @Colton127 #533
